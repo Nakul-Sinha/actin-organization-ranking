@@ -14,21 +14,22 @@ pair log loss (lower is better). Constant 0.5 → 69.31; AI baseline → 74.
 - **`approach.md`** — paste-ready approach write-up.
 
 ## Method (see approach.md for detail)
-The 900 labels are perfectly explained by one per-tile latent score, so the task is
-to learn `z(image)` that generalizes to unseen tiles. The pairs are **matched on
-intensity/texture/gradient/coverage**, so the model must be **confound-orthogonal**:
+The 900 labels are perfectly explained by one per-tile latent score. Two failure modes had
+to be fixed: matched confounds (intensity/texture/gradient/coverage) and a real train→test
+distribution shift. The model is **confound-orthogonal AND transfer-robust**:
 1. 155 per-tile morphology/topology features.
-2. Residualize them against a confound basis (model can't use the matched confounds).
-3. Linear Bradley-Terry on the per-tile feature difference.
-4. Orthogonalize the test pair logits against the pair's confound differences (→ all
-   confound correlations ≈ 0).
-5. Conservative tile-disjoint OOF temperature + clip.
+2. **Rank-normalize** each feature within its set (train/test) — removes the marginal shift.
+3. **Drop the 50% most train/test-shifted features.**
+4. Residualize vs a confound basis; linear Bradley-Terry on feature differences; orthogonalize
+   test logits vs the pair's confound differences (→ confound correlations ≈ 0).
+5. Calibrate on a **simulated train→test shift** (not optimistic OOF), mildly conservative.
 
-CPU-only, deterministic, no network. Confound-orthogonal OOF ≈ 67.3 gap-weighted log loss.
+CPU-only, deterministic, no network. Simulated-shift validation: shift-acc ≈ 0.55, loss ≈ 68.4.
 
-> Note: an earlier all-features linear+deep ensemble scored a flattering ~62 OOF but
-> **87.6 on the real test** because it rode the matched gradient-magnitude confound. The
-> current approach is the fix; see approach.md "what I learned the hard way".
+> Journey (see approach.md): all-features ensemble → **87.6** (rode the gradient confound);
+> confound-orthogonal → **73** (still worse than the 69.31 constant — morphology features
+> anti-correlate under shift); rank-norm + shift-stable + confound-orthogonal → **~68 proxy**.
+> A simulated-shift proxy (reproduces the live failure) is what made transfer measurable.
 
 ## Repository layout
 - `solution.py` — official self-contained solver (assembled from `src/` via `src/build_solution.py`).
