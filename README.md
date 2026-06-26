@@ -14,14 +14,21 @@ pair log loss (lower is better). Constant 0.5 → 69.31; AI baseline → 74.
 - **`approach.md`** — paste-ready approach write-up.
 
 ## Method (see approach.md for detail)
-The 900 training labels are perfectly explained by one per-tile latent score, so
-the task is to learn `z(image)` that generalizes to unseen tiles. A calibrated
-~50/50 blend of two per-tile scorers:
-1. Linear Bradley-Terry on 155 hand-crafted morphology/topology features.
-2. Pretrained ResNet-18 regressing the distilled Bradley-Terry latent score.
-Each is temperature-calibrated on tile-disjoint out-of-fold predictions.
+The 900 labels are perfectly explained by one per-tile latent score, so the task is
+to learn `z(image)` that generalizes to unseen tiles. The pairs are **matched on
+intensity/texture/gradient/coverage**, so the model must be **confound-orthogonal**:
+1. 155 per-tile morphology/topology features.
+2. Residualize them against a confound basis (model can't use the matched confounds).
+3. Linear Bradley-Terry on the per-tile feature difference.
+4. Orthogonalize the test pair logits against the pair's confound differences (→ all
+   confound correlations ≈ 0).
+5. Conservative tile-disjoint OOF temperature + clip.
 
-Local OOF (tile-disjoint, mirrors the all-unseen test set): ~62 gap-weighted log loss.
+CPU-only, deterministic, no network. Confound-orthogonal OOF ≈ 67.3 gap-weighted log loss.
+
+> Note: an earlier all-features linear+deep ensemble scored a flattering ~62 OOF but
+> **87.6 on the real test** because it rode the matched gradient-magnitude confound. The
+> current approach is the fix; see approach.md "what I learned the hard way".
 
 ## Repository layout
 - `solution.py` — official self-contained solver (assembled from `src/` via `src/build_solution.py`).
