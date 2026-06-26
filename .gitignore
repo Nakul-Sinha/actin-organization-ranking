@@ -1,5 +1,6 @@
 working/*.npz
 working/*.png
+working/*.log
 research/*.npz
 research/*.pt
 __pycache__/

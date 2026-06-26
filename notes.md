@@ -38,4 +38,34 @@
 - Pretrained ImageNet backbones: allowed if reproducible; watch A10 network availability for weight download.
 
 ## Experiment log
-(append CV / public results here)
+- Hand-crafted morphology (118 feats) + linear BT: ~67.5 OOF.
+- +Topology/shape/spatial feats (155 feats): linbt 64.4 OOF (98% cov), acc 0.62. <- robust core.
+- Frozen ImageNet feats (resnet18): 73 (OOD, weak). DROPPED.
+- CNN Siamese pairwise (resnet18 full finetune): overfits, ~69 (=constant). DROPPED.
+- CNN regression to BT-z, from-scratch small net: 0.50 acc (fails). DROPPED.
+- **CNN regression to BT-z, pretrained resnet18, drop=0.5 wd=3e-2: acc 0.656, raw 67.4, needs calibration (T~0.4).**
+  Higher acc than hand-crafted + different errors => ensemble candidate.
+- Models that work: linear BT on feature diff (best single), ExtraTrees-on-z, deep resnet18-regression.
+- Key: deep needs pretrained ImageNet weights (network) + GPU. Hand-crafted is the bulletproof CPU core.
+
+## Current best
+- Submission v1 (hand-crafted ensemble): OOF ~64.4. VALID.
+- **Submission v2 (hand-crafted linbt + deep resnet18-regression, ~50/50 calibrated blend): OOF ~61.9.** VALID.
+  - linbt 64.28 (acc .628, T1.18) + deep 63.53 (acc .643, T1.12); equal-mean 61.89 ≈ weighted 61.87 (robust).
+- solution.py: self-contained, AST-assembled from tested modules, reads dataset/public or dataset.
+  - BUG fixed: ast.get_source_segment drops decorators -> predict_z lost @torch.no_grad(). grab() now includes decorator lines.
+- Deliverables: solution.py, working/submission.csv, submission.csv (mirror), approach.md, README, src/, research/.
+- **Canonical: solution.py self-reported OOF 62.43 (lin 63.55 + deep 65.70, blend w_lin=0.68), 11.3min, VALID.**
+  - Isolated clean-dir run (only solution.py + dataset/public) reproduced OOF 62.82 from scratch -> no hardcoding/leakage.
+  - solution.py uses leaner 12-split/2-seed OOF (vs dev 16-split) -> deep OOF noisier -> slightly conservative blend; still ~62.
+
+## Deep model recipe (what finally generalized)
+- Distill 900 weighted pairs -> per-tile BT latent z (LogReg +1/-1 design, C=0.5).
+- Pretrained resnet18 (in_chans=1) REGRESSES z. drop=0.5, wd=3e-2, backbone lr=3e-4, OneCycle,
+  on-GPU dihedral+affine aug, per-image standardize, Huber(beta .5), 8-view dihedral TTA, seed-ensemble.
+- Calibrate via OOF temperature. NOT pairwise Siamese (overfit), NOT from-scratch (0.50 acc).
+
+## Decisions
+- Official solution = hand-crafted ensemble (robust, CPU, no-network, standard libs) +/- deep resnet18 if gain is real.
+- Calibration is the main lever for the LOSS metric (acc ~0.62-0.66); keep predictions honest, not overconfident.
+- Metric up-weights large-gap (easy) pairs => train with pair_weight, let confidence track the gap.
