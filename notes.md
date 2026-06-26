@@ -62,6 +62,17 @@
 - Models that work: linear BT on feature diff (best single), ExtraTrees-on-z, deep resnet18-regression.
 - Key: deep needs pretrained ImageNet weights (network) + GPU. Hand-crafted is the bulletproof CPU core.
 
+## !!! SUBMISSION 2 (confound-orthogonal) scored 73 on real test — still > constant 69.31 !!!
+- 73 = worse than constant. Confound-orthogonal morphology features ANTI-CORRELATE under train->test shift.
+- Built a SIMULATED-SHIFT PROXY (research/sim_shift2.py): train-vs-test direction splits train tiles into
+  train-like/test-like; train on one, eval on other. Reproduces the failure (method A shift-acc 0.438 ~ 73).
+- FIX (src/build_transfer.py, submission 3): rank-normalize feats within each set (transductive domain adapt)
+  + drop 50% most train/test-shifted feats + confound-orth + calibrate on the proxy.
+  - Proxy shift-acc 0.553, shift-loss 68.40 (vs constant 69.31). std 0.053, confound-corr ~0.004.
+- solution.py rebuilt (transfer-robust), reproduced isolated (proxy-loss 68.40, 74s).
+- LESSON: when test is distribution-shifted, validate on a SIMULATED shift, not train-OOF. Rank-norm + drop
+  shifted feats recovers transfer. Hand-crafted ceiling ~0.55 shift-acc; SSL/in-distribution feats = next lever.
+
 ## FINAL (robust) deliverable
 - Approach: confound-ORTHOGONAL linear Bradley-Terry. CPU-only, deterministic, no network/pretrained.
   - 155 morphology feats -> residualize vs confound basis -> linear BT on feat diffs ->
