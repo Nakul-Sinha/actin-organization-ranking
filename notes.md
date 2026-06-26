@@ -37,6 +37,20 @@
 - Calibrated probabilities (not hard 0/1). Official solution must train from dataset/public/ inside runtime.
 - Pretrained ImageNet backbones: allowed if reproducible; watch A10 network availability for weight download.
 
+## !!! REAL TEST SCORE 87.62 — WORSE THAN CONSTANT (69.31). Diagnosed + fixing. !!!
+- Root cause (research/diagnose.py): my predictions rode the MATCHED gradient-magnitude confound
+  (corr(prob, L-R gradmag)=+0.437). In train gradmag has AUC 0.604 (spurious residual); test pairs
+  are matched on gradient => that residual vanishes/inverts => anti-correlated => 87.6.
+- Also: train/test tile distribution shift (classifier AUC 0.62-0.67) incl. topology feats.
+- Why OOF lied: held-out TRAIN tiles share the same spurious confound residual => OOF rewarded the shortcut.
+- FIX (src/build_robust.py): (1) residualize features against confound basis; (2) post-hoc
+  orthogonalize pair logits against pair confound DIFFERENCES (matched=>uninformative in test);
+  (3) conservative calibration (OOF was ~25pts optimistic on loss).
+  - Confound-ORTHOGONAL OOF: acc 0.613, loss 67.25 (genuine signal survives). Test-pred confound corr ~0 (all).
+  - Submission std 0.076, clip [0.34,0.66] (vs failed 0.16, confound corr 0.437).
+- Testing if a confound-INVARIANT deep model (blur+gamma aug) adds orthogonal signal (research/deep_robust.py).
+- LESSON: with matched confounds, validate confound-ORTHOGONALITY of predictions, not just OOF. Be conservative.
+
 ## Experiment log
 - Hand-crafted morphology (118 feats) + linear BT: ~67.5 OOF.
 - +Topology/shape/spatial feats (155 feats): linbt 64.4 OOF (98% cov), acc 0.62. <- robust core.
@@ -47,6 +61,17 @@
   Higher acc than hand-crafted + different errors => ensemble candidate.
 - Models that work: linear BT on feature diff (best single), ExtraTrees-on-z, deep resnet18-regression.
 - Key: deep needs pretrained ImageNet weights (network) + GPU. Hand-crafted is the bulletproof CPU core.
+
+## FINAL (robust) deliverable
+- Approach: confound-ORTHOGONAL linear Bradley-Terry. CPU-only, deterministic, no network/pretrained.
+  - 155 morphology feats -> residualize vs confound basis -> linear BT on feat diffs ->
+    orthogonalize test logits vs pair confound diffs -> conservative calib (OOF best-T x2.0, clip [0.32,0.68]).
+  - Confound-orthogonal OOF: acc ~0.61, loss ~67.3 (genuine signal). Test-pred max|confound-corr| ~0.02.
+  - solution.py self-contained (src/build_solution.py assembles from features.py + build_robust.py).
+  - Isolated clean-dir run reproduced it end-to-end (acc 0.619, loss 66.4, valid sub).
+- Deep confound-invariant CNN (blur/gamma aug) tested: acc 0.574 < linear 0.613 => deep does NOT help.
+  Confirms bottleneck was confound reliance (method), not compute. H100 not needed.
+- Old deep+linear ensemble (87.6) modules moved to research/.
 
 ## Current best
 - Submission v1 (hand-crafted ensemble): OOF ~64.4. VALID.
