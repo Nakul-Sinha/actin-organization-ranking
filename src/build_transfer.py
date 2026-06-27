@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from build_robust import img_confounds, residualize, orthogonalize, pair_confdiff, metric, CONF_FEATS
 
 ROOT = Path("dataset"); WORK = Path("working")
-KEEP_PCT, C_LIN, T_MULT, CLIP = 0.5, 0.01, 1.25, 0.30
+KEEP_PCT, C_LIN, T_MULT, CLIP = 0.5, 0.01, 3.0, 0.10
 
 
 def rank_norm(F, ref):
