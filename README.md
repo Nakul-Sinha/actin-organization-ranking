@@ -1,44 +1,41 @@
-# Microscopy Actin Pairwise Organization Ranking
+# Actin Organization Ranking
 
-Pairwise ranking of STED-FM microscopy tiles: predict the probability that the left
-tile has the higher hidden actin-organization score. Metric: gap-weighted pair log
-loss (lower better). Constant 0.5 → 69.31; AI baseline → 74.
+## The problem
 
-**Result: 61.5 (rank 1).**
+I get matched pairs of grayscale STED-FM microscopy tiles and have to predict the
+probability that the left tile has the higher hidden actin organization score.
 
-## Official deliverable
-- **`solution.py`** — self-contained. Reads `./dataset/public/` (→ `./dataset/`),
-  trains/extracts in-runtime, writes `./working/submission.csv`. Targets a single
-  24 GB GPU (A10) in <30 min; needs network for public pretrained weights.
-- **`submission.csv`** — the rank-1 predictions (450 rows).
-- **`approach.md`** — paste-ready write-up + the full journey.
+The pairs are constructed adversarially. Left and right are deliberately close in
+visible intensity, texture, gradient strength and dark pixel fraction, while
+their hidden annotation topology differs by a real margin. So brightness and
+coverage tell me nothing, and the answer has to come from filament morphology:
+boundary structure, punctate organization, compact assemblies, protrusive
+patterns.
 
-## Method (see approach.md)
-Equal-weight ensemble of strong per-tile organization scorers, each a linear
-Bradley-Terry model on a powerful representation:
-1. **Siamese RankNet CNN ensemble** — ImageNet-init ResNet-18/34/50, trained on the
-   pairwise labels, heavy augmentation, seed-ensembled, TTA.
-2. **Frozen foundation-model features → linear BT** — DINOv2 (small/base/large/giant)
-   + ConvNeXt (large/XXL).
+Scoring is gap-weighted pair log loss, lower is better. A constant 0.5 scores
+69.31 and the baseline is 74.
 
-Each scorer's test-pair logits are normalized to unit std, summed (equal weight), and
-calibrated to prob-std ≈ 0.14. Adding the **large DINOv2 / ConvNeXt-XXL** models is what
-took the score from 65.6 to **61.5**.
+## What I did
 
-Key finding: **only strong learned representations transfer** to the matched,
-distribution-shifted test set — hand-crafted morphology, SSL, and the matched confounds
-do not (they land above the 0.5 constant). No local validation predicted transfer; the
-public leaderboard was the only honest signal.
+An equal weight ensemble of per-tile organization scorers, each a linear
+Bradley-Terry model on top of a strong representation. Half of them are Siamese
+RankNet CNNs, ImageNet initialized ResNet-18, 34 and 50, trained on the pairwise
+labels with heavy augmentation, seed ensembled and with TTA. The other half are
+frozen foundation model features, DINOv2 in four sizes and ConvNeXt large and
+XXL, each feeding a linear Bradley-Terry head. I normalize each scorer's test
+pair logits to unit standard deviation, sum them, and calibrate.
 
-## Repository layout
-- `solution.py` — official solver (CNN ensemble + frozen foundation features + grand).
-- `src/` — earlier tested modules (feature extraction, confound analysis, transfer proxy).
-- `research/` — H100 experiment scripts (CNN fleets, frozen extraction, calibration) and
-  rejected explorations (confound, SSL, simulated-shift proxy).
-- `notes.md` — challenge facts + full experiment log.
+Result: 61.5, first place.
 
-## Reproduce
-```
-python solution.py                 # writes working/submission.csv
-```
-`CNN_SEEDS` / `CNN_EPOCHS` env vars trade runtime vs ensemble size.
+The finding I would keep from this one is that only strong learned
+representations transferred. Hand crafted morphology features, self supervised
+variants, and the matched confounds all landed worse than the constant 0.5
+baseline. Nothing in my local validation predicted which would transfer, and the
+public leaderboard was the only honest signal I had. Adding the largest DINOv2
+and ConvNeXt-XXL is what moved the score from 65.6 to 61.5.
+
+## Layout
+
+`python solution.py` writes the submission. `src/` has earlier modules, and
+`research/` holds the experiment fleets plus the explorations I rejected.
+`TECHNICAL.md` and `notes.md` carry the full log. Datasets are not committed.
