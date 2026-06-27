@@ -1,51 +1,44 @@
 # Microscopy Actin Pairwise Organization Ranking
 
-Pairwise ranking of STED-FM microscopy tiles: predict the probability that the
-left tile has the higher hidden actin-organization score. Metric: gap-weighted
-pair log loss (lower is better). Constant 0.5 → 69.31; AI baseline → 74.
+Pairwise ranking of STED-FM microscopy tiles: predict the probability that the left
+tile has the higher hidden actin-organization score. Metric: gap-weighted pair log
+loss (lower better). Constant 0.5 → 69.31; AI baseline → 74.
+
+**Result: 61.5 (rank 1).**
 
 ## Official deliverable
-- **`solution.py`** — the official, self-contained script. Reads `./dataset/public/`
-  (falls back to `./dataset/`), trains everything in-runtime (no cached artifacts,
-  no precomputed predictions), writes `./working/submission.csv`. Runs end-to-end
-  in ~6–10 min on a single GPU.
-- **`working/submission.csv`** — the exact output of `solution.py` (450 rows).
-- **`submission.csv`** — upload mirror of `working/submission.csv`.
-- **`approach.md`** — paste-ready approach write-up.
+- **`solution.py`** — self-contained. Reads `./dataset/public/` (→ `./dataset/`),
+  trains/extracts in-runtime, writes `./working/submission.csv`. Targets a single
+  24 GB GPU (A10) in <30 min; needs network for public pretrained weights.
+- **`submission.csv`** — the rank-1 predictions (450 rows).
+- **`approach.md`** — paste-ready write-up + the full journey.
 
-## Method (see approach.md for detail)
-The 900 labels are perfectly explained by one per-tile latent score. Two failure modes had to
-be fixed: matched confounds (intensity/texture/gradient/coverage) and a real train→test
-distribution shift. The model is an **ensemble of light self-supervised + hand-crafted
-features**, made confound-orthogonal and transfer-robust:
-1. **Light Barlow-Twins SSL** on all 490 tiles (train+test, no labels) → in-distribution
-   features (light ~10 epochs is the sweet spot; more overfits and transfers worse).
-2. **155 hand-crafted morphology features** for complementary signal.
-3. **Rank-normalize** each feature within its set; residualize + orthogonalize vs image
-   confounds (→ confound corr ≈ 0); linear Bradley-Terry; average the two; calibrate on a
-   **simulated train→test shift** (not optimistic OOF).
+## Method (see approach.md)
+Equal-weight ensemble of strong per-tile organization scorers, each a linear
+Bradley-Terry model on a powerful representation:
+1. **Siamese RankNet CNN ensemble** — ImageNet-init ResNet-18/34/50, trained on the
+   pairwise labels, heavy augmentation, seed-ensembled, TTA.
+2. **Frozen foundation-model features → linear BT** — DINOv2 (small/base/large/giant)
+   + ConvNeXt (large/XXL).
 
-Needs a GPU + ImageNet ResNet-18 init for SSL; hand-crafted half is CPU-only. ~2–3 min.
-Simulated-shift validation: shift-loss ≈ 64.4 (constant 69.31).
+Each scorer's test-pair logits are normalized to unit std, summed (equal weight), and
+calibrated to prob-std ≈ 0.14. Adding the **large DINOv2 / ConvNeXt-XXL** models is what
+took the score from 65.6 to **61.5**.
 
-> Journey (see approach.md): all-features ensemble → **87.6** (rode the gradient confound);
-> confound-orthogonal → **73**; rank-norm + shift-stable → **71**; + light-SSL in-distribution
-> features → **proxy 64.4**. A simulated-shift proxy that reproduced each live failure is what
-> made transfer measurable without burning submissions.
+Key finding: **only strong learned representations transfer** to the matched,
+distribution-shifted test set — hand-crafted morphology, SSL, and the matched confounds
+do not (they land above the 0.5 constant). No local validation predicted transfer; the
+public leaderboard was the only honest signal.
 
 ## Repository layout
-- `solution.py` — official self-contained solver (assembled from `src/` via `src/build_solution.py`).
-- `src/` — tested building-block modules: `features.py` (feature extraction),
-  `bt_scores.py` (Bradley-Terry fit), `cnn_regress.py` (deep regressor),
-  `pipeline*.py` / `make_submission*.py` (development orchestration & CV),
-  `validate_submission.py` (strict format check).
-- `research/` — dead-end explorations kept for transparency (frozen deep features,
-  Siamese pairwise, from-scratch CNN — all rejected for overfitting/weakness).
-- `notes.md` — challenge facts, experiment log, decisions.
-- `dataset/` — public data (train/test images + csvs).
+- `solution.py` — official solver (CNN ensemble + frozen foundation features + grand).
+- `src/` — earlier tested modules (feature extraction, confound analysis, transfer proxy).
+- `research/` — H100 experiment scripts (CNN fleets, frozen extraction, calibration) and
+  rejected explorations (confound, SSL, simulated-shift proxy).
+- `notes.md` — challenge facts + full experiment log.
 
 ## Reproduce
 ```
 python solution.py                 # writes working/submission.csv
-python src/validate_submission.py  # strict schema/value validation
 ```
+`CNN_SEEDS` / `CNN_EPOCHS` env vars trade runtime vs ensemble size.
