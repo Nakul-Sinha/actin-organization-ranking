@@ -14,22 +14,24 @@ pair log loss (lower is better). Constant 0.5 → 69.31; AI baseline → 74.
 - **`approach.md`** — paste-ready approach write-up.
 
 ## Method (see approach.md for detail)
-The 900 labels are perfectly explained by one per-tile latent score. Two failure modes had
-to be fixed: matched confounds (intensity/texture/gradient/coverage) and a real train→test
-distribution shift. The model is **confound-orthogonal AND transfer-robust**:
-1. 155 per-tile morphology/topology features.
-2. **Rank-normalize** each feature within its set (train/test) — removes the marginal shift.
-3. **Drop the 50% most train/test-shifted features.**
-4. Residualize vs a confound basis; linear Bradley-Terry on feature differences; orthogonalize
-   test logits vs the pair's confound differences (→ confound correlations ≈ 0).
-5. Calibrate on a **simulated train→test shift** (not optimistic OOF), mildly conservative.
+The 900 labels are perfectly explained by one per-tile latent score. Two failure modes had to
+be fixed: matched confounds (intensity/texture/gradient/coverage) and a real train→test
+distribution shift. The model is an **ensemble of light self-supervised + hand-crafted
+features**, made confound-orthogonal and transfer-robust:
+1. **Light Barlow-Twins SSL** on all 490 tiles (train+test, no labels) → in-distribution
+   features (light ~10 epochs is the sweet spot; more overfits and transfers worse).
+2. **155 hand-crafted morphology features** for complementary signal.
+3. **Rank-normalize** each feature within its set; residualize + orthogonalize vs image
+   confounds (→ confound corr ≈ 0); linear Bradley-Terry; average the two; calibrate on a
+   **simulated train→test shift** (not optimistic OOF).
 
-CPU-only, deterministic, no network. Simulated-shift validation: shift-acc ≈ 0.55, loss ≈ 68.4.
+Needs a GPU + ImageNet ResNet-18 init for SSL; hand-crafted half is CPU-only. ~2–3 min.
+Simulated-shift validation: shift-loss ≈ 64.4 (constant 69.31).
 
 > Journey (see approach.md): all-features ensemble → **87.6** (rode the gradient confound);
-> confound-orthogonal → **73** (still worse than the 69.31 constant — morphology features
-> anti-correlate under shift); rank-norm + shift-stable + confound-orthogonal → **~68 proxy**.
-> A simulated-shift proxy (reproduces the live failure) is what made transfer measurable.
+> confound-orthogonal → **73**; rank-norm + shift-stable → **71**; + light-SSL in-distribution
+> features → **proxy 64.4**. A simulated-shift proxy that reproduced each live failure is what
+> made transfer measurable without burning submissions.
 
 ## Repository layout
 - `solution.py` — official self-contained solver (assembled from `src/` via `src/build_solution.py`).
