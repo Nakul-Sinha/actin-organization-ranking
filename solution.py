@@ -1,20 +1,3 @@
-"""Microscopy Actin Pairwise Organization Ranking — official solution.
-
-Equal-weight ensemble of strong per-tile organization scorers, each a linear
-Bradley-Terry model on frozen foundation-model features or a trained Siamese CNN.
-Every scorer emits a per-tile score; pairwise predictions are differences, made
-globally consistent across the reused-tile graph. Diverse strong features +
-variance reduction are what transfer to the matched, distribution-shifted test set
-(hand-crafted morphology and the matched confounds do NOT transfer).
-
-Pipeline (reads ./dataset/public/ -> ./dataset/ fallback, writes ./working/submission.csv):
-  1. Siamese RankNet CNN ensemble (ImageNet-init backbones, heavy aug, seed-ensembled).
-  2. Frozen DINOv2 (small/base/large/giant) + ConvNeXt (large/XXL) features -> linear BT.
-  3. Normalize each scorer's test-pair logits to unit std, sum (equal weight),
-     calibrate to prob-std ~0.14 (empirically optimal on the leaderboard).
-
-Targets a single 24GB GPU (A10) in <30 min. Needs public pretrained weights (timm/HF).
-"""
 import warnings, time, math, os
 warnings.filterwarnings("ignore")
 import numpy as np, pandas as pd
@@ -29,8 +12,8 @@ CAL_STD = 0.14
 CNN_BACKBONES = ["resnet18", "resnet34", "resnet50"]
 CNN_SEEDS = int(os.environ.get("CNN_SEEDS", "4"))
 CNN_EPOCHS = int(os.environ.get("CNN_EPOCHS", "25"))
-TTA_ROT = 4       # CNN test-time rotations (CNN inference is cheap)
-FROZEN_TTA = 1    # frozen-feature TTA passes (1 = none; the big transformers dominate runtime)
+TTA_ROT = 4
+FROZEN_TTA = 1
 FROZEN_MODELS = [
     "vit_small_patch14_dinov2.lvd142m",
     "vit_base_patch14_dinov2.lvd142m",
@@ -48,7 +31,6 @@ def preload(tiles, root):
     return torch.from_numpy(a)
 
 
-# ----------------------------- CNN (Siamese RankNet) -----------------------------
 def cnn_aug(x):
     if torch.rand(1).item() < .5: x = torch.flip(x, [3])
     if torch.rand(1).item() < .5: x = torch.flip(x, [2])
@@ -109,7 +91,6 @@ def train_cnn(imgs, L, R, y, w, bb, seed, bs=64):
     return cnn_tta(model, imgs)
 
 
-# ----------------------------- frozen foundation features -----------------------------
 @torch.no_grad()
 def frozen_feats(mname, x128, bs=24):
     kw = dict(pretrained=True, num_classes=0)
@@ -156,7 +137,6 @@ def main():
     x128 = preload(allt, ROOT)
     components = []
 
-    # 1) CNN ensemble
     imgs = x128.to(DEV); cnn = 0
     for bb in CNN_BACKBONES:
         for sd in range(CNN_SEEDS):
@@ -165,7 +145,6 @@ def main():
     components.append(cnn/(np.std(cnn)+1e-8))
     del imgs; torch.cuda.empty_cache()
 
-    # 2) frozen foundation features -> linear BT
     for mname in FROZEN_MODELS:
         try:
             Fa = frozen_feats(mname, x128); Ftr = Fa[:ntr]; Fte = Fa[ntr:]
@@ -177,7 +156,6 @@ def main():
         except Exception as e:
             print(f"[solution] frozen {mname} FAILED: {repr(e)[:100]}")
 
-    # 3) equal-weight grand + calibrate
     grand = np.sum(components, axis=0)
     prob = calib(grand, CAL_STD)
     sub = pd.DataFrame({"id": te["id"].values, "prob_left_higher_organization": prob})
