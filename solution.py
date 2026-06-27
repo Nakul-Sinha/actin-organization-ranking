@@ -121,11 +121,13 @@ def frozen_feats(mname, x128, bs=24):
     x = F.interpolate(x128, size=(res, res), mode="bilinear", align_corners=False).repeat(1, 3, 1, 1)
     x = (x - mean) / std
     out = []
+    use_amp = (DEV == "cuda")
     for i in range(0, len(x), bs):
         xb = x[i:i+bs].to(DEV); acc = 0; n = 0
-        for k in range(FROZEN_TTA):
-            v = xb if k == 0 else torch.rot90(xb, k, [2, 3])
-            acc = acc + model(v).float(); n += 1
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            for k in range(FROZEN_TTA):
+                v = xb if k == 0 else torch.rot90(xb, k, [2, 3])
+                acc = acc + model(v).float(); n += 1
         out.append((acc/n).cpu().numpy())
     del model; torch.cuda.empty_cache()
     return np.concatenate(out, 0)
