@@ -9,3 +9,9 @@ src/__pycache__/
 working/submission_robust.csv
 working/submission_transfer.csv
 working/submission_ssl.csv
+working/cands*/
+working/UPLOAD/
+working/*.npy
+working/cands_*.csv
+working/cand_*.csv
+working/*.log
