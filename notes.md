@@ -1,5 +1,18 @@
 # Notes — Microscopy Actin Pairwise Organization Ranking
 
+## *** FINAL: 61.5 (RANK 1). Winning recipe = equal-weight ensemble of strong learned scorers. ***
+- Siamese RankNet CNN ensemble (resnet18/34/50, heavy aug, seed-ensemble, TTA) ~65.9.
+- Frozen foundation features -> linear BT: DINOv2 small/base/large/giant + ConvNeXt large/XXL.
+- Each scorer -> per-tile score; normalize test-pair logits to unit std; SUM equal-weight; calibrate prob-std 0.14.
+- Progression: CNN 65.9, DINOv2-small/base+convnext-l 66.4, combined 65.6; +DINOv2-large/giant+convnext-XXL -> 61.5.
+- Calibration: prob-std 0.10->65.6, 0.14->61.5 (optimal), 0.20->66.2, 0.26->70.3.
+- CONFOUND (intensity/gradient) does NOT transfer (70.5) -> dropped. More diverse STRONG models = lower.
+- WRONG earlier conclusion "morphology doesn't transfer": my hand-crafted/SSL morphology was just too weak.
+- No local validation predicted transfer; LB was the only signal. solution.py = A10/30min config (trimmed CNN + 4x TTA).
+- H100: redirect HF cache to /mnt (HF_HOME=/mnt/work/hfcache); root disk fills up.
+
+
+
 ## Challenge facts
 - Task: pairwise ranking of STED-FM grayscale microscopy tiles. Predict P(left tile has higher hidden actin-organization score).
 - Metric: **Gap-Weighted Pair Log Loss**, lower is better. `min(100, 100 * sum(w*logloss)/sum(w))`, prob clipped to [1e-6, 1-1e-6].
