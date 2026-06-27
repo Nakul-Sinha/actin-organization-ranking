@@ -1,4 +1,4 @@
-# Notes — Microscopy Actin Pairwise Organization Ranking
+# Notes: Microscopy Actin Pairwise Organization Ranking
 
 ## *** FINAL: 61.5 (RANK 1). Winning recipe = equal-weight ensemble of strong learned scorers. ***
 - Siamese RankNet CNN ensemble (resnet18/34/50, heavy aug, seed-ensemble, TTA) ~65.9.
@@ -42,7 +42,7 @@
 ## Compute
 - Local: RTX 4050, 6.4 GB VRAM. Dev here (fast iteration).
 - Kaggle T4 (16GB) via KAGGLE_API_TOKEN if bigger backbone needed.
-- H100 (shared) reserved for large sweeps only — overkill for this tiny data.
+- H100 (shared) reserved for large sweeps only, overkill for this tiny data.
 - FINAL solution targets A10 (24GB, ~30 min), Kaggle-standard libs (torch, torchvision, timm, sklearn, skimage).
 
 ## Compliance reminders
@@ -50,7 +50,7 @@
 - Calibrated probabilities (not hard 0/1). Official solution must train from dataset/public/ inside runtime.
 - Pretrained ImageNet backbones: allowed if reproducible; watch A10 network availability for weight download.
 
-## !!! REAL TEST SCORE 87.62 — WORSE THAN CONSTANT (69.31). Diagnosed + fixing. !!!
+## !!! REAL TEST SCORE 87.62: WORSE THAN CONSTANT (69.31). Diagnosed + fixing. !!!
 - Root cause (research/diagnose.py): my predictions rode the MATCHED gradient-magnitude confound
   (corr(prob, L-R gradmag)=+0.437). In train gradmag has AUC 0.604 (spurious residual); test pairs
   are matched on gradient => that residual vanishes/inverts => anti-correlated => 87.6.
@@ -85,7 +85,7 @@
 - solution.py now trains light SSL + extracts hand feats + ensembles. Needs GPU + resnet18 ImageNet init.
 - Gate: SSL+hand (64.4) >> hand-alone (67.4) on SAME proxy => submit. H100 was unreachable; local GPU fine.
 
-## !!! SUBMISSION 2 (confound-orthogonal) scored 73 on real test — still > constant 69.31 !!!
+## !!! SUBMISSION 2 (confound-orthogonal) scored 73 on real test: still > constant 69.31 !!!
 - 73 = worse than constant. Confound-orthogonal morphology features ANTI-CORRELATE under train->test shift.
 - Built a SIMULATED-SHIFT PROXY (research/sim_shift2.py): train-vs-test direction splits train tiles into
   train-like/test-like; train on one, eval on other. Reproduces the failure (method A shift-acc 0.438 ~ 73).

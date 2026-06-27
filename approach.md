@@ -1,4 +1,4 @@
-# Approach — Microscopy Actin Pairwise Organization Ranking
+# Approach: Microscopy Actin Pairwise Organization Ranking
 
 **Recommended time spent: 16 hours** · **Leaderboard: 61.5 gap-weighted pair log loss (rank 1)**
 
@@ -15,17 +15,17 @@ A per-tile score from each of several scorers; pairwise prediction = score diffe
 Each scorer's test-pair logits are normalized to unit std, summed (equal weight), and the
 total is calibrated so the predicted-probability std ≈ 0.14 (empirically optimal).
 
-1. **Siamese RankNet CNN ensemble** — ImageNet-initialized backbones (ResNet-18/34/50,
+1. **Siamese RankNet CNN ensemble**: ImageNet-initialized backbones (ResNet-18/34/50,
    ConvNeXt-nano), `in_chans=1`, trained directly on the pairwise labels with heavy on-GPU
    augmentation (dihedral + affine + brightness/contrast/gamma + noise), seed-ensembled,
    dihedral TTA. (≈ 65.9 alone.)
-2. **Frozen foundation-model features → linear Bradley-Terry** — DINOv2 (small / base /
+2. **Frozen foundation-model features → linear Bradley-Terry**: DINOv2 (small / base /
    **large** / **giant**) and ConvNeXt (large / **XXL**), each: resize to native resolution,
    3-channel, dihedral-TTA-averaged features → logistic regression on per-tile feature
    differences → per-tile score. (DINOv2-small/base + ConvNeXt-large ≈ 66.4 alone.)
 
 **Adding the large DINOv2 / ConvNeXt-XXL models is what dropped the score from 65.6 to
-61.5** — diverse *strong* features, equally weighted, give the variance reduction and
+61.5**, diverse *strong* features, equally weighted, give the variance reduction and
 representational power that transfer across the train→test shift.
 
 ## Calibration
@@ -33,11 +33,11 @@ The metric punishes confident-wrong predictions, so confidence is tuned on the l
 prob-std 0.10 → 65.6, **0.14 → 65.2/61.5**, 0.20 → 66.2, 0.26 → 70.3. Optimal ≈ **0.14**.
 
 ## What I learned the hard way (the real story)
-- **Submission 1** (all features incl. confounds, over-confident): **87.6** — it rode the
+- **Submission 1** (all features incl. confounds, over-confident): **87.6**: it rode the
   matched gradient-magnitude confound.
-- **Submissions 2–5** (confound-orthogonal hand-crafted / SSL morphology, conservative):
-  73 → 71 → 70 — above the 0.5 constant (69.31). I wrongly concluded "morphology doesn't
-  transfer." It does — my *hand-crafted/SSL* morphology was simply too weak, and no
+- **Submissions 2 to 5** (confound-orthogonal hand-crafted / SSL morphology, conservative):
+  73 → 71 → 70, above the 0.5 constant (69.31). I wrongly concluded "morphology doesn't
+  transfer." It does, my *hand-crafted/SSL* morphology was simply too weak, and no
   local validation (OOF or simulated-shift proxy) could predict transfer; the leaderboard
   was the only honest signal.
 - **The breakthrough:** strong *learned* representations (trained Siamese CNNs + frozen
@@ -46,7 +46,7 @@ prob-std 0.10 → 65.6, **0.14 → 65.2/61.5**, 0.20 → 66.2, 0.26 → 70.3. Op
 
 ## Local validation
 None of OOF, tile-disjoint CV, or a simulated train→test shift predicted real performance
-here (they were optimistic-to-anti-correlated — the within-train distribution cannot
+here (they were optimistic-to-anti-correlated, the within-train distribution cannot
 reproduce the real shift). Model selection and calibration were therefore driven by the
 public leaderboard. Final: **61.5**.
 
