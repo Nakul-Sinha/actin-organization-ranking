@@ -1,25 +1,25 @@
 """Microscopy Actin Pairwise Organization Ranking — official solution.
 
-TRANSFER-ROBUST confound-orthogonal Bradley-Terry ranker (self-contained,
-CPU-only, deterministic, no network). Reads ./dataset/public/ (falls back to
+TRANSFER-ROBUST ensemble of light self-supervised (Barlow Twins) features and
+hand-crafted morphology features. Reads ./dataset/public/ (falls back to
 ./dataset/), writes ./working/submission.csv.
 
-The test tiles are distribution-shifted from train, and the pairs are matched on
-intensity/texture/gradient/coverage. A model that uses the confounds OR the
-shift-sensitive raw feature scales fails on the matched, shifted test set. So:
-  1. extract 155 per-tile morphology/topology features;
-  2. rank-normalize each feature within its own set (train among train, test among
-     test) -> removes the marginal train/test distribution shift;
-  3. drop the 50% most train/test-shifted features;
-  4. residualize against a confound basis + orthogonalize the test pair logits
-     against the pair's confound differences (=> ~0 confound correlation);
-  5. calibrate the temperature on a SIMULATED train->test shift (a train-vs-test
-     direction splits train tiles into train-like/test-like halves; train on one,
-     score the other), mildly conservative.
-Metric: gap-weighted pair log loss. Every model emits a per-tile score so
-predictions stay consistent across the reused-tile graph.
+Why this design (learned from leaderboard feedback):
+  - pairs are matched on intensity/texture/gradient/coverage, so a model using
+    those confounds rides a spurious TRAIN residual and fails on the matched test;
+  - train and test tiles are distribution-shifted, and raw morphology features
+    ANTI-CORRELATE under that shift.
+So: (1) light Barlow-Twins SSL on ALL 490 tiles (train+test images, no labels) gives
+in-distribution features; light (~10 epochs) is the sweet spot — more overfits the
+~500 tiles; (2) hand-crafted morphology features add complementary signal;
+(3) rank-normalize each feature within its set (removes marginal shift); (4) residualize
++ orthogonalize against image confounds (=> ~0 confound correlation); (5) calibrate the
+temperature on a SIMULATED train->test shift (not optimistic OOF), mildly conservative.
+
+Requires a GPU and the public ImageNet ResNet-18 weights (timm) for the SSL init; the
+hand-crafted half is CPU-only. ~2-3 min runtime. Metric: gap-weighted pair log loss.
 """
-import warnings, time
+import warnings, math, time
 warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
@@ -32,13 +32,13 @@ from skimage import filters, feature, morphology, measure
 from skimage.filters import sato, frangi, meijering, gabor_kernel
 from skimage.morphology import disk
 from sklearn.linear_model import LogisticRegression
+import torch, torch.nn as nn, torch.nn.functional as F
+import timm
 
 _GABOR = None
-CONF_FEATS = ["int_mean", "int_std", "int_max", "dark_frac", "nz_frac", "grad_mean",
-              "grad_std", "glcm_contrast_mean", "glcm_contrast_std",
-              "glcm_dissimilarity_mean", "shannon_entropy", "fg_frac", "blob_n",
-              "cc_area_sum"]
-KEEP_PCT, C_LIN, T_MULT, CLIP = 0.5, 0.01, 1.25, 0.30
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+C_LIN, T_MULT, CLIP = 0.02, 1.25, 0.32
+SSL_EPOCHS, SSL_SEEDS = 10, 3
 
 
 
@@ -388,6 +388,92 @@ def _fractal_dimension(Z):
     return -coeffs[0]
 
 
+# ===== ssl_train.py =====
+
+class BarlowTwins(nn.Module):
+    def __init__(self, backbone="resnet18", pretrained=True, dim=1024):
+        super().__init__()
+        self.enc = timm.create_model(backbone, pretrained=pretrained, num_classes=0, in_chans=1)
+        d = self.enc.num_features
+        self.proj = nn.Sequential(nn.Linear(d, dim), nn.BatchNorm1d(dim), nn.ReLU(),
+                                  nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.ReLU(),
+                                  nn.Linear(dim, dim, bias=False))
+        self.bn = nn.BatchNorm1d(dim, affine=False)
+
+    def forward(self, x1, x2):
+        z1 = self.bn(self.proj(self.enc(x1))); z2 = self.bn(self.proj(self.enc(x2)))
+        B = z1.shape[0]
+        c = (z1.T @ z2) / B
+        on = torch.diagonal(c).add_(-1).pow_(2).sum()
+        off = (c.pow(2).sum() - torch.diagonal(c).pow(2).sum())
+        return on + 5e-3 * off
+
+def aug(x):
+    """One augmented view on [0,1] images: geometric + intensity (NO blur)."""
+    B = x.shape[0]
+    if torch.rand(1).item() < 0.5: x = torch.flip(x, dims=[3])
+    if torch.rand(1).item() < 0.5: x = torch.flip(x, dims=[2])
+    k = int(torch.randint(0, 4, (1,)).item())
+    if k: x = torch.rot90(x, k, dims=[2, 3])
+    ang = (torch.rand(B, device=x.device) * 2 - 1) * (30 * math.pi / 180)
+    cos, sin = torch.cos(ang), torch.sin(ang)
+    sc = 0.7 + torch.rand(B, device=x.device) * 0.45            # random resized crop-ish
+    tx = (torch.rand(B, device=x.device) * 2 - 1) * 0.15
+    ty = (torch.rand(B, device=x.device) * 2 - 1) * 0.15
+    th = torch.zeros(B, 2, 3, device=x.device)
+    th[:, 0, 0] = cos * sc; th[:, 0, 1] = -sin * sc; th[:, 0, 2] = tx
+    th[:, 1, 0] = sin * sc; th[:, 1, 1] = cos * sc; th[:, 1, 2] = ty
+    grid = F.affine_grid(th, x.shape, align_corners=False)
+    x = F.grid_sample(x, grid, align_corners=False, padding_mode="reflection").clamp(0, 1)
+    gamma = torch.exp((torch.rand(B, 1, 1, 1, device=x.device) * 2 - 1) * 0.6)
+    x = x.clamp(1e-4, 1) ** gamma
+    c = 0.6 + torch.rand(B, 1, 1, 1, device=x.device) * 0.8
+    m = x.mean(dim=[2, 3], keepdim=True); x = ((x - m) * c + m).clamp(0, 1)
+    x = x + torch.randn_like(x) * 0.02
+    mu = x.mean(dim=[2, 3], keepdim=True); sd = x.std(dim=[2, 3], keepdim=True) + 1e-5
+    return (x - mu) / sd
+
+def norm_only(x):
+    mu = x.mean(dim=[2, 3], keepdim=True); sd = x.std(dim=[2, 3], keepdim=True) + 1e-5
+    return (x - mu) / sd
+
+def train_features(backbone="resnet18", pretrained=True, epochs=40, bs=128, lr=1e-3, seed=0, imgs=None, tiles=None, ntr=None):
+    """Train light SSL and RETURN features (no save). Optionally reuse preloaded imgs.
+    When imgs is given, pass ntr (number of train tiles) to avoid any path dependency."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    if imgs is None:
+        trt, tet = all_tiles(); tiles = trt + tet; imgs = preload(tiles)
+        ntr = len(trt)
+    elif ntr is None:
+        trt, tet = all_tiles(); ntr = len(trt)
+    n = len(tiles)
+    model = BarlowTwins(backbone, pretrained).to(DEV)
+    if epochs > 0:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        steps = max(1, n // bs)
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, epochs=epochs, steps_per_epoch=steps, pct_start=0.1)
+    for ep in range(epochs):
+        model.train(); perm = torch.randperm(n, device=DEV)
+        for s in range(steps):
+            idx = perm[s * bs:(s + 1) * bs]
+            if len(idx) < 8: continue
+            loss = model(aug(imgs[idx]), aug(imgs[idx]))
+            opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+    model.eval()
+    with torch.no_grad():
+        feats = []
+        for i in range(0, n, 128):
+            xb = imgs[i:i+128]; acc = 0; nv = 0
+            for fh in [False, True]:
+                for kk in range(4):
+                    v = torch.flip(xb, dims=[3]) if fh else xb
+                    if kk: v = torch.rot90(v, kk, dims=[2, 3])
+                    acc = acc + model.enc(norm_only(v)); nv += 1
+            feats.append((acc / nv).cpu().numpy())
+        feats = np.concatenate(feats, 0)
+    return feats[:ntr], feats[ntr:]
+
+
 # ===== build_robust.py =====
 
 def metric(y, p, w):
@@ -402,18 +488,6 @@ def img_confounds(rel, root):
                      (a > 0).mean(), (a > 50).mean(),
                      np.abs(gx).mean()+np.abs(gy).mean(), lap])
 
-def residualize(F, conf_cols, fit_mask):
-    C = F[:, conf_cols]
-    Cz = (C - C[fit_mask].mean(0)) / (C[fit_mask].std(0) + 1e-8)
-    Cz = np.c_[Cz, np.ones(len(Cz))]
-    out = F.copy()
-    for j in range(F.shape[1]):
-        if j in conf_cols:
-            out[:, j] = 0.0; continue
-        coef, *_ = np.linalg.lstsq(Cz[fit_mask], F[fit_mask, j], rcond=None)
-        out[:, j] = F[:, j] - Cz @ coef
-    return out
-
 def orthogonalize(logit, Dconf):
     """Remove linear component of logit explained by confound differences."""
     D = np.c_[Dconf, np.ones(len(Dconf))]
@@ -424,13 +498,21 @@ def pair_confdiff(pairs_left, pairs_right, confmap):
     return np.array([confmap[l] - confmap[r] for l, r in zip(pairs_left, pairs_right)])
 
 
-# ===== build_transfer.py =====
+# ===== build_ssl.py =====
 
 def rank_norm(F, ref):
     out = np.empty_like(F)
     for j in range(F.shape[1]):
-        sv = np.sort(ref[:, j])
-        out[:, j] = np.searchsorted(sv, F[:, j], side="right") / (len(sv) + 1.0)
+        sv = np.sort(ref[:, j]); out[:, j] = np.searchsorted(sv, F[:, j], side="right") / (len(sv) + 1.0)
+    return out
+
+def residualize_ext(F, Cmat, fit_mask):
+    Cz = (Cmat - Cmat[fit_mask].mean(0)) / (Cmat[fit_mask].std(0) + 1e-8)
+    Cz = np.c_[Cz, np.ones(len(Cz))]
+    out = F.copy()
+    for j in range(F.shape[1]):
+        coef, *_ = np.linalg.lstsq(Cz[fit_mask], F[fit_mask, j], rcond=None)
+        out[:, j] = F[:, j] - Cz @ coef
     return out
 
 def directions(Ftr, Fte, n=6):
@@ -442,112 +524,125 @@ def directions(Ftr, Fte, n=6):
         out.append((LogisticRegression(C=0.05, max_iter=2000).fit(Xz[s], lab[s]).coef_.ravel(), mu, sd))
     return out
 
-def fit_predict(Frank_tr, keep, conf_idx, fit_mask, L, R, y, w, trm, Dvam_idx=None):
-    F = Frank_tr.copy(); F[:, ~keep] = 0.0
-    Fr = residualize(F, conf_idx, fit_mask)
-    Fz = (Fr - Fr[fit_mask].mean(0)) / (Fr[fit_mask].std(0) + 1e-8)
-    clf = LogisticRegression(C=C_LIN, max_iter=4000)
-    clf.fit((Fz[L] - Fz[R])[trm], y[trm], sample_weight=w[trm])
-    s = Fz @ clf.coef_.ravel()
-    return s, (s[L[trm]] - s[R[trm]]).std() + 1e-8
-
-def core(tr, te, tiles, Ftr, te_tiles, Fte, keys, root):
-    conf_idx = sorted(set(keys.index(k) for k in CONF_FEATS if k in keys))
+def core(tr, te, tiles, Ftr_ssl, te_tiles, Fte_ssl, Hand, Hte, root, use_hand=True):
     confmap = {t: img_confounds(t, root) for t in set(tiles) | set(te_tiles)}
     idx = {t: i for i, t in enumerate(tiles)}; teidx = {t: i for i, t in enumerate(te_tiles)}
     L = np.array([idx[t] for t in tr.left_image_path]); R = np.array([idx[t] for t in tr.right_image_path])
     y = tr.left_higher_organization.values.astype(int); w = tr.pair_weight.values.astype(float)
     Dall = pair_confdiff(tr.left_image_path.values, tr.right_image_path.values, confmap)
-    smd = np.abs((Ftr.mean(0) - Fte.mean(0)) / (np.sqrt(0.5*(Ftr.var(0)+Fte.var(0))) + 1e-8))
-    keep = smd <= np.percentile(smd, KEEP_PCT * 100)
+    Cmat = np.array([confmap[t] for t in tiles]); Cte = np.array([confmap[t] for t in te_tiles])
     nT = len(tiles)
 
-    # ---- calibrate temperature on the simulated-shift proxy ----
-    POOL_lg, POOL_y, POOL_w = [], [], []
-    for cf, mu, sd in directions(Ftr, Fte):
-        proj = ((Ftr - mu) / sd) @ cf; order = np.argsort(proj)
+    # feature blocks to ensemble: SSL (+ optionally hand-crafted)
+    blocks = [("ssl", Ftr_ssl, Fte_ssl)]
+    if use_hand:
+        blocks.append(("hand", Hand, Hte))
+
+    # ---- proxy calibration (simulated shift via hand-crafted direction) ----
+    splits = []
+    for cf, mu, sd in directions(Hand, Hte):
+        proj = ((Hand - mu) / sd) @ cf; order = np.argsort(proj)
         for frac in (0.38, 0.45):
             k = int(nT * frac); tl = np.zeros(nT, bool); vl = np.zeros(nT, bool)
-            tl[order[:k]] = True; vl[order[-k:]] = True
-            trm = np.array([(tl[l] and tl[r]) for l, r in zip(L, R)])
-            vam = np.array([(vl[l] and vl[r]) for l, r in zip(L, R)])
-            if trm.sum() < 30 or vam.sum() < 20:
-                continue
-            Frank = Ftr.copy(); Frank[tl] = rank_norm(Ftr, Ftr[tl])[tl]; Frank[vl] = rank_norm(Ftr, Ftr[vl])[vl]
-            s, sdt = fit_predict(Frank, keep, conf_idx, tl, L, R, y, w, trm)
-            lg = orthogonalize((s[L[vam]] - s[R[vam]]) / sdt, Dall[vam]); lg /= (np.std(lg) + 1e-8)
-            POOL_lg.append(lg); POOL_y.append(y[vam]); POOL_w.append(w[vam])
-    plg = np.concatenate(POOL_lg); py = np.concatenate(POOL_y); pw = np.concatenate(POOL_w)
+            tl[order[:k]] = True; vl[order[-k:]] = True; splits.append((tl, vl))
+    PL, PY, PW = [], [], []
+    for tl, vl in splits:
+        trm = np.array([(tl[l] and tl[r]) for l, r in zip(L, R)])
+        vam = np.array([(vl[l] and vl[r]) for l, r in zip(L, R)])
+        if trm.sum() < 30 or vam.sum() < 20:
+            continue
+        lo = np.zeros(vam.sum())
+        for name, Ftr, _ in blocks:
+            Fp = Ftr.copy(); Fp[tl] = rank_norm(Ftr, Ftr[tl])[tl]; Fp[vl] = rank_norm(Ftr, Ftr[vl])[vl]
+            Fr = residualize_ext(Fp, Cmat, tl); Fz = (Fr - Fr[tl].mean(0)) / (Fr[tl].std(0) + 1e-8)
+            clf = LogisticRegression(C=C_LIN, max_iter=4000)
+            clf.fit((Fz[L] - Fz[R])[trm], y[trm], sample_weight=w[trm])
+            s = Fz @ clf.coef_.ravel(); sdt = (s[L[trm]] - s[R[trm]]).std() + 1e-8
+            l = orthogonalize((s[L[vam]] - s[R[vam]]) / sdt, Dall[vam]); lo = lo + l / (np.std(l) + 1e-8)
+        lo /= len(blocks); lo /= (np.std(lo) + 1e-8)
+        PL.append(lo); PY.append(y[vam]); PW.append(w[vam])
+    plg = np.concatenate(PL); py = np.concatenate(PY); pw = np.concatenate(PW)
     T_opt = min(np.linspace(0.5, 12, 120), key=lambda T: metric(py, 1/(1+np.exp(-plg/T)), pw))
-    proxy_loss = metric(py, 1/(1+np.exp(-plg/T_opt)), pw)
-    proxy_acc = ((plg > 0).astype(int) == py).mean()
+    proxy_loss = metric(py, 1/(1+np.exp(-plg/T_opt)), pw); proxy_acc = ((plg > 0).astype(int) == py).mean()
     T_safe = T_opt * T_MULT
-    print(f"[transfer] proxy shift: acc={proxy_acc:.3f} loss={proxy_loss:.2f} T_opt={T_opt:.2f} -> T_safe={T_safe:.2f}")
 
-    # ---- final fit on ALL train tiles ----
-    Frank_all = Ftr.copy(); Frank_all[:] = rank_norm(Ftr, Ftr)
-    Fte_rank = rank_norm(Fte, Fte)
-    allmask = np.ones(nT, bool)
-    F = Frank_all.copy(); F[:, ~keep] = 0.0
-    Fr = residualize(F, conf_idx, allmask)
-    # residualize test (rank-normed) with train-fit confound model
-    Fte_use = Fte_rank.copy(); Fte_use[:, ~keep] = 0.0
-    Cc = Fr[:, conf_idx]  # zeros (residualized); use original rank confs for test removal
-    # simpler: residualize test against train rank-confounds directly
-    Cz = Frank_all[:, conf_idx]; mC = Cz.mean(0); sCc = Cz.std(0) + 1e-8
-    Ctr = np.c_[(Cz - mC) / sCc, np.ones(nT)]; Cte = np.c_[(Fte_rank[:, conf_idx] - mC) / sCc, np.ones(len(Fte))]
-    Fte_r = Fte_use.copy()
-    for j in range(Fte.shape[1]):
-        if (j in conf_idx) or (not keep[j]):
-            Fte_r[:, j] = 0.0; continue
-        coef, *_ = np.linalg.lstsq(Ctr, Frank_all[:, j], rcond=None); Fte_r[:, j] = Fte_rank[:, j] - Cte @ coef
-    mu = Fr.mean(0); sd = Fr.std(0) + 1e-8; Fz = (Fr - mu) / sd; Fz_te = (Fte_r - mu) / sd
-    clf = LogisticRegression(C=C_LIN, max_iter=4000); clf.fit(Fz[L] - Fz[R], y, sample_weight=w)
-    coef = clf.coef_.ravel(); s_tr = Fz @ coef; s_te = Fz_te @ coef
-    sdt = (s_tr[L] - s_tr[R]).std() + 1e-8
+    # ---- final: fit on all train, predict test ----
     Lt = np.array([teidx[t] for t in te.left_image_path]); Rt = np.array([teidx[t] for t in te.right_image_path])
-    lg_te = (s_te[Lt] - s_te[Rt]) / sdt
     Dte = pair_confdiff(te.left_image_path.values, te.right_image_path.values, confmap)
-    lg_te = orthogonalize(lg_te, Dte); lg_te /= (np.std(lg_te) + 1e-8)
+    allmask = np.ones(nT, bool)
+    lg_te = np.zeros(len(te))
+    for name, Ftr, Fte in blocks:
+        Ftr_p = rank_norm(Ftr, Ftr); Fte_p = rank_norm(Fte, Fte)
+        Fr = residualize_ext(Ftr_p, Cmat, allmask)
+        # residualize test against train-fit confound model
+        Cz = (Cmat - Cmat.mean(0)) / (Cmat.std(0) + 1e-8); Cz = np.c_[Cz, np.ones(nT)]
+        Cte_z = np.c_[(Cte - Cmat.mean(0)) / (Cmat.std(0) + 1e-8), np.ones(len(Cte))]
+        Fte_r = Fte_p.copy()
+        for j in range(Fte_p.shape[1]):
+            coef, *_ = np.linalg.lstsq(Cz, Ftr_p[:, j], rcond=None); Fte_r[:, j] = Fte_p[:, j] - Cte_z @ coef
+        mu = Fr.mean(0); sd = Fr.std(0) + 1e-8; Fz = (Fr - mu) / sd; Fz_te = (Fte_r - mu) / sd
+        clf = LogisticRegression(C=C_LIN, max_iter=4000); clf.fit(Fz[L] - Fz[R], y, sample_weight=w)
+        c = clf.coef_.ravel(); s_tr = Fz @ c; s_te = Fz_te @ c
+        sdt = (s_tr[L] - s_tr[R]).std() + 1e-8
+        l = orthogonalize((s_te[Lt] - s_te[Rt]) / sdt, Dte); lg_te = lg_te + l / (np.std(l) + 1e-8)
+    lg_te /= len(blocks); lg_te /= (np.std(lg_te) + 1e-8)
     prob = np.clip(1/(1+np.exp(-lg_te / T_safe)), 0.5 - CLIP, 0.5 + CLIP)
-    return tr, te, te_tiles, prob, Dte, dict(proxy_loss=proxy_loss, proxy_acc=proxy_acc, T_safe=T_safe)
+    return prob, Dte, dict(proxy_loss=proxy_loss, proxy_acc=proxy_acc, T_safe=T_safe, blocks=[b[0] for b in blocks])
 
+# ----------------------------- hand-crafted feature driver -----------------------------
 def _extract_one(arg):
     rel, root = arg
     im = np.array(Image.open(Path(root) / rel), dtype=np.uint8)
     d = extract(im); keys = sorted(d.keys())
-    return rel, np.array([d[k] for k in keys], dtype=np.float32), keys
+    return rel, np.array([d[k] for k in keys], dtype=np.float32)
 
 
 def extract_features(tiles, root, workers=6):
-    rows = {}; keys = None
+    rows = {}
     args = [(t, str(root)) for t in tiles]
     try:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for rel, vec, k in ex.map(_extract_one, args, chunksize=8):
-                rows[rel] = vec; keys = k
+            for rel, vec in ex.map(_extract_one, args, chunksize=8):
+                rows[rel] = vec
     except Exception:
         for a in args:
-            rel, vec, k = _extract_one(a); rows[rel] = vec; keys = k
-    return np.stack([rows[t] for t in tiles]), keys
+            rel, vec = _extract_one(a); rows[rel] = vec
+    return np.stack([rows[t] for t in tiles]).astype(float)
+
+
+def preload_imgs(tiles, root):
+    a = np.zeros((len(tiles), 1, 128, 128), np.float32)
+    for i, t in enumerate(tiles):
+        a[i, 0] = np.array(Image.open(Path(root) / t), np.float32) / 255.0
+    return torch.from_numpy(a).to(DEV)
 
 
 def main():
     t0 = time.time()
     ROOT = Path("dataset/public") if (Path("dataset/public") / "train.csv").exists() else Path("dataset")
     WORK = Path("working"); WORK.mkdir(exist_ok=True, parents=True)
-    print(f"[solution] ROOT={ROOT}")
+    print(f"[solution] ROOT={ROOT} DEV={DEV}")
     tr = pd.read_csv(ROOT / "train.csv"); te = pd.read_csv(ROOT / "test.csv")
     sample = pd.read_csv(ROOT / "sample_submission.csv")
-    tiles = sorted(set(tr.left_image_path) | set(tr.right_image_path))
-    te_tiles = sorted(set(te.left_image_path) | set(te.right_image_path))
-    print("[solution] extracting features...")
-    Ftr, keys = extract_features(tiles, ROOT)
-    Fte, _ = extract_features(te_tiles, ROOT)
-    print(f"[solution] features tr{Ftr.shape} te{Fte.shape} ({time.time()-t0:.0f}s)")
+    trt = sorted(set(tr.left_image_path) | set(tr.right_image_path))
+    tet = sorted(set(te.left_image_path) | set(te.right_image_path))
+    tiles_all = trt + tet; ntr = len(trt)
 
-    tr, te, te_tiles, prob, Dte, info = core(tr, te, tiles, Ftr.astype(float),
-                                             te_tiles, Fte.astype(float), keys, ROOT)
+    print("[solution] light SSL on all tiles...")
+    imgs = preload_imgs(tiles_all, ROOT)
+    ftr = 0; fte = 0
+    for seed in range(SSL_SEEDS):
+        a1, a2 = train_features(pretrained=True, epochs=SSL_EPOCHS, seed=seed, imgs=imgs,
+                                tiles=tiles_all, ntr=ntr)
+        ftr = ftr + a1; fte = fte + a2
+    Ftr_ssl = (ftr / SSL_SEEDS).astype(float); Fte_ssl = (fte / SSL_SEEDS).astype(float)
+    print(f"[solution] SSL feats tr{Ftr_ssl.shape} te{Fte_ssl.shape} ({time.time()-t0:.0f}s)")
+
+    print("[solution] hand-crafted features...")
+    Hand = extract_features(trt, ROOT); Hte = extract_features(tet, ROOT)
+    print(f"[solution] hand feats ({time.time()-t0:.0f}s)")
+
+    prob, Dte, info = core(tr, te, trt, Ftr_ssl, tet, Fte_ssl, Hand, Hte, ROOT, use_hand=True)
     cc = max(abs(np.corrcoef(Dte[:, i], prob)[0, 1]) for i in range(Dte.shape[1]))
     print(f"[solution] proxy-shift acc={info['proxy_acc']:.3f} loss={info['proxy_loss']:.2f} "
           f"T_safe={info['T_safe']:.2f} max|confound-corr|={cc:.3f}")
