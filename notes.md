@@ -62,6 +62,16 @@
 - Models that work: linear BT on feature diff (best single), ExtraTrees-on-z, deep resnet18-regression.
 - Key: deep needs pretrained ImageNet weights (network) + GPU. Hand-crafted is the bulletproof CPU core.
 
+## !!! SUBMISSION 3 (rank-norm transfer) scored 71. SUBMISSION 4 = light-SSL + hand ensemble. !!!
+- 71 still > constant (69.31). Proxy was 68.4, real 71 (gap ~+2.6): real shift harder than simulated.
+- BREAKTHROUGH: LIGHT self-supervised features (Barlow Twins, ALL 490 tiles, ~10 epochs, 3-seed).
+  - In-distribution (trained on train+test images, no labels). Aug = geometric+intensity, NO blur.
+  - LIGHT is key: ep10 proxy 64.9, ep25 65.3, ep50 66.2, frozen-ImageNet 67.3. Heavy SSL overfits 490 tiles.
+  - Ensemble SSL+hand: proxy-loss 64.40, acc 0.608, confound-corr 0.008. <- BEST.
+- src/build_ssl.py (core), research/ssl_train.py (Barlow Twins), research/ssl_sweep.py (epoch sweep).
+- solution.py now trains light SSL + extracts hand feats + ensembles. Needs GPU + resnet18 ImageNet init.
+- Gate: SSL+hand (64.4) >> hand-alone (67.4) on SAME proxy => submit. H100 was unreachable; local GPU fine.
+
 ## !!! SUBMISSION 2 (confound-orthogonal) scored 73 on real test — still > constant 69.31 !!!
 - 73 = worse than constant. Confound-orthogonal morphology features ANTI-CORRELATE under train->test shift.
 - Built a SIMULATED-SHIFT PROXY (research/sim_shift2.py): train-vs-test direction splits train tiles into

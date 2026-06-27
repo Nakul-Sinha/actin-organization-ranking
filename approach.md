@@ -19,22 +19,25 @@ The final model is therefore **confound-orthogonal AND transfer-robust**, and is
 against a *simulated* train→test shift rather than ordinary out-of-fold (which is optimistic
 here).
 
-## Model architecture (linear Bradley-Terry on processed morphology features)
-1. **155 per-tile morphology/topology features** (connected-component shape stats, skeleton
-   topology, ridge/tubeness filters, Gabor orientation energy, granulometry, distance-
-   transform thickness, spatial point-pattern stats, Euler number/holes, fractal dimension,
-   lacunarity).
-2. **Rank-normalize** each feature within its own set (train among train, test among test)
-   — removes the marginal train/test distribution shift (transductive, no labels).
-3. **Drop the 50% most train/test-shifted features** (by standardized mean difference).
-4. **Residualize** against a confound basis, fit **linear Bradley-Terry** on per-tile
-   feature differences, and **orthogonalize the test pair logits against the pair's confound
-   differences** → every confound correlation ≈ 0.
-5. **Calibrate on a simulated shift**: a train-vs-test direction splits train tiles into
-   train-like / test-like halves; train on one, score the other; pick the temperature that
-   minimizes loss there (mildly conservative).
+## Model architecture (ensemble of light-SSL + hand-crafted features)
+Two per-tile feature sets, each turned into a per-tile organization score and averaged:
+1. **Light self-supervised features.** Barlow Twins on ALL 490 tiles (train+test images, no
+   labels) → **in-distribution** features that don't shift between train and test.
+   Augmentation is geometric + intensity/contrast/gamma (NO blur — blur destroys morphology).
+   Crucially **light** (~10 epochs, 3-seed ensemble): more epochs overfit the ~500 tiles and
+   transfer *worse* (proxy-loss ep10 64.9 vs ep50 66.2 vs frozen-ImageNet 67.3).
+2. **155 hand-crafted morphology/topology features** (connected-component shape stats,
+   skeleton topology, ridge filters, Gabor energy, granulometry, fractal dimension, …) — adds
+   complementary signal (ensemble proxy-loss 64.4 vs SSL-alone 65.2).
 
-CPU-only, deterministic, no network or pretrained weights; runs in ~80 s.
+Both go through the same transfer-robust processing: **rank-normalize** each feature within
+its set (removes the marginal shift), **residualize + orthogonalize** against image confounds
+(→ confound correlations ≈ 0), fit **linear Bradley-Terry** on per-tile feature differences,
+average the two calibrated logits, and **calibrate the temperature on a simulated train→test
+shift** (mildly conservative).
+
+Needs a GPU + public ImageNet ResNet-18 weights for the SSL init; the hand-crafted half is
+CPU-only. ~2–3 min runtime.
 
 ## What I learned the hard way (this is the real story)
 - **Submission 1** (all features, linear+deep ensemble, confident): a flattering ~62 OOF but
