@@ -1,7 +1,8 @@
-"""Assemble the self-contained SSL+hand transfer-robust solution.py via AST.
+"""Assemble the self-contained transfer-robust solution.py via AST.
 
-Pulls exact tested functions: hand-crafted feature extraction, light Barlow-Twins
-SSL, confound removal, and the rank-norm / proxy-calibration ensemble core.
+Pulls exact tested functions (feature extraction + confound removal + the
+rank-norm/shift-stable transfer core) so the official script matches what was
+validated on the simulated-shift proxy. CPU-only, deterministic, no network.
 """
 import ast
 from pathlib import Path
@@ -24,26 +25,26 @@ def grab(file, names):
 
 HEADER = '''"""Microscopy Actin Pairwise Organization Ranking — official solution.
 
-TRANSFER-ROBUST ensemble of light self-supervised (Barlow Twins) features and
-hand-crafted morphology features. Reads ./dataset/public/ (falls back to
+TRANSFER-ROBUST confound-orthogonal Bradley-Terry ranker (self-contained,
+CPU-only, deterministic, no network). Reads ./dataset/public/ (falls back to
 ./dataset/), writes ./working/submission.csv.
 
-Why this design (learned from leaderboard feedback):
-  - pairs are matched on intensity/texture/gradient/coverage, so a model using
-    those confounds rides a spurious TRAIN residual and fails on the matched test;
-  - train and test tiles are distribution-shifted, and raw morphology features
-    ANTI-CORRELATE under that shift.
-So: (1) light Barlow-Twins SSL on ALL 490 tiles (train+test images, no labels) gives
-in-distribution features; light (~10 epochs) is the sweet spot — more overfits the
-~500 tiles; (2) hand-crafted morphology features add complementary signal;
-(3) rank-normalize each feature within its set (removes marginal shift); (4) residualize
-+ orthogonalize against image confounds (=> ~0 confound correlation); (5) calibrate the
-temperature on a SIMULATED train->test shift (not optimistic OOF), mildly conservative.
-
-Requires a GPU and the public ImageNet ResNet-18 weights (timm) for the SSL init; the
-hand-crafted half is CPU-only. ~2-3 min runtime. Metric: gap-weighted pair log loss.
+The test tiles are distribution-shifted from train, and the pairs are matched on
+intensity/texture/gradient/coverage. A model that uses the confounds OR the
+shift-sensitive raw feature scales fails on the matched, shifted test set. So:
+  1. extract 155 per-tile morphology/topology features;
+  2. rank-normalize each feature within its own set (train among train, test among
+     test) -> removes the marginal train/test distribution shift;
+  3. drop the 50% most train/test-shifted features;
+  4. residualize against a confound basis + orthogonalize the test pair logits
+     against the pair's confound differences (=> ~0 confound correlation);
+  5. calibrate the temperature on a SIMULATED train->test shift (a train-vs-test
+     direction splits train tiles into train-like/test-like halves; train on one,
+     score the other), mildly conservative.
+Metric: gap-weighted pair log loss. Every model emits a per-tile score so
+predictions stay consistent across the reused-tile graph.
 """
-import warnings, math, time
+import warnings, time
 warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
@@ -56,71 +57,53 @@ from skimage import filters, feature, morphology, measure
 from skimage.filters import sato, frangi, meijering, gabor_kernel
 from skimage.morphology import disk
 from sklearn.linear_model import LogisticRegression
-import torch, torch.nn as nn, torch.nn.functional as F
-import timm
 
 _GABOR = None
-DEV = "cuda" if torch.cuda.is_available() else "cpu"
-C_LIN, T_MULT, CLIP = 0.02, 1.25, 0.32
-SSL_EPOCHS, SSL_SEEDS = 10, 3
+CONF_FEATS = ["int_mean", "int_std", "int_max", "dark_frac", "nz_frac", "grad_mean",
+              "grad_std", "glcm_contrast_mean", "glcm_contrast_std",
+              "glcm_dissimilarity_mean", "shannon_entropy", "fg_frac", "blob_n",
+              "cc_area_sum"]
+KEEP_PCT, C_LIN, T_MULT, CLIP = 0.5, 0.01, 3.0, 0.10
 '''
 
 
 MAIN = r'''
-# ----------------------------- hand-crafted feature driver -----------------------------
 def _extract_one(arg):
     rel, root = arg
     im = np.array(Image.open(Path(root) / rel), dtype=np.uint8)
     d = extract(im); keys = sorted(d.keys())
-    return rel, np.array([d[k] for k in keys], dtype=np.float32)
+    return rel, np.array([d[k] for k in keys], dtype=np.float32), keys
 
 
 def extract_features(tiles, root, workers=6):
-    rows = {}
+    rows = {}; keys = None
     args = [(t, str(root)) for t in tiles]
     try:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for rel, vec in ex.map(_extract_one, args, chunksize=8):
-                rows[rel] = vec
+            for rel, vec, k in ex.map(_extract_one, args, chunksize=8):
+                rows[rel] = vec; keys = k
     except Exception:
         for a in args:
-            rel, vec = _extract_one(a); rows[rel] = vec
-    return np.stack([rows[t] for t in tiles]).astype(float)
-
-
-def preload_imgs(tiles, root):
-    a = np.zeros((len(tiles), 1, 128, 128), np.float32)
-    for i, t in enumerate(tiles):
-        a[i, 0] = np.array(Image.open(Path(root) / t), np.float32) / 255.0
-    return torch.from_numpy(a).to(DEV)
+            rel, vec, k = _extract_one(a); rows[rel] = vec; keys = k
+    return np.stack([rows[t] for t in tiles]), keys
 
 
 def main():
     t0 = time.time()
     ROOT = Path("dataset/public") if (Path("dataset/public") / "train.csv").exists() else Path("dataset")
     WORK = Path("working"); WORK.mkdir(exist_ok=True, parents=True)
-    print(f"[solution] ROOT={ROOT} DEV={DEV}")
+    print(f"[solution] ROOT={ROOT}")
     tr = pd.read_csv(ROOT / "train.csv"); te = pd.read_csv(ROOT / "test.csv")
     sample = pd.read_csv(ROOT / "sample_submission.csv")
-    trt = sorted(set(tr.left_image_path) | set(tr.right_image_path))
-    tet = sorted(set(te.left_image_path) | set(te.right_image_path))
-    tiles_all = trt + tet; ntr = len(trt)
+    tiles = sorted(set(tr.left_image_path) | set(tr.right_image_path))
+    te_tiles = sorted(set(te.left_image_path) | set(te.right_image_path))
+    print("[solution] extracting features...")
+    Ftr, keys = extract_features(tiles, ROOT)
+    Fte, _ = extract_features(te_tiles, ROOT)
+    print(f"[solution] features tr{Ftr.shape} te{Fte.shape} ({time.time()-t0:.0f}s)")
 
-    print("[solution] light SSL on all tiles...")
-    imgs = preload_imgs(tiles_all, ROOT)
-    ftr = 0; fte = 0
-    for seed in range(SSL_SEEDS):
-        a1, a2 = train_features(pretrained=True, epochs=SSL_EPOCHS, seed=seed, imgs=imgs,
-                                tiles=tiles_all, ntr=ntr)
-        ftr = ftr + a1; fte = fte + a2
-    Ftr_ssl = (ftr / SSL_SEEDS).astype(float); Fte_ssl = (fte / SSL_SEEDS).astype(float)
-    print(f"[solution] SSL feats tr{Ftr_ssl.shape} te{Fte_ssl.shape} ({time.time()-t0:.0f}s)")
-
-    print("[solution] hand-crafted features...")
-    Hand = extract_features(trt, ROOT); Hte = extract_features(tet, ROOT)
-    print(f"[solution] hand feats ({time.time()-t0:.0f}s)")
-
-    prob, Dte, info = core(tr, te, trt, Ftr_ssl, tet, Fte_ssl, Hand, Hte, ROOT, use_hand=True)
+    tr, te, te_tiles, prob, Dte, info = core(tr, te, tiles, Ftr.astype(float),
+                                             te_tiles, Fte.astype(float), keys, ROOT)
     cc = max(abs(np.corrcoef(Dte[:, i], prob)[0, 1]) for i in range(Dte.shape[1]))
     print(f"[solution] proxy-shift acc={info['proxy_acc']:.3f} loss={info['proxy_loss']:.2f} "
           f"T_safe={info['T_safe']:.2f} max|confound-corr|={cc:.3f}")
@@ -145,13 +128,12 @@ if __name__ == "__main__":
 def build():
     feat = grab("features.py", ["_gabor_bank", "_safe", "_stats", "extract",
                                 "_lacunarity", "_gini", "_fractal_dimension"])
-    ssl = grab("../research/ssl_train.py", ["BarlowTwins", "aug", "norm_only", "train_features"])
-    rob = grab("build_robust.py", ["metric", "img_confounds", "orthogonalize", "pair_confdiff"])
-    sslh = grab("build_ssl.py", ["rank_norm", "residualize_ext", "directions", "core"])
+    rob = grab("build_robust.py", ["metric", "img_confounds", "residualize",
+                                   "orthogonalize", "pair_confdiff"])
+    trans = grab("build_transfer.py", ["rank_norm", "directions", "fit_predict", "core"])
     parts = [HEADER, "\n\n# ===== features.py =====\n", "\n\n".join(feat),
-             "\n\n# ===== ssl_train.py =====\n", "\n\n".join(ssl),
              "\n\n# ===== build_robust.py =====\n", "\n\n".join(rob),
-             "\n\n# ===== build_ssl.py =====\n", "\n\n".join(sslh), MAIN]
+             "\n\n# ===== build_transfer.py =====\n", "\n\n".join(trans), MAIN]
     OUT.write_text("\n".join(parts), encoding="utf-8")
     ast.parse(OUT.read_text())
     print(f"wrote {OUT} ({len(OUT.read_text().splitlines())} lines)")
